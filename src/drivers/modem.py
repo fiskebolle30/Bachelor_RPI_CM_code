@@ -1,12 +1,11 @@
 """ Provides power control and status information for the RC7620 modem """
 import logging
 import time
-from enum import Enum, auto
 import usb.core
-import usb.util
 import os
 import serial
 import RPi.GPIO as GPIO
+
 from .lock import Lock
 
 logger = logging.getLogger(__name__)

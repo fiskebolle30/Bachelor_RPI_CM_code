@@ -8,16 +8,26 @@ import subprocess
 import os
 import logging
 import shutil
-import filecmp
 import json
 import RPi.GPIO as GPIO
-from datetime import datetime
 import time
 import requests
+import soundfile as sf
+import datetime as dt
+
+from google.cloud import storage
+from drivers.modem import Modem
+from .logs import Log
 
 # Create a logger for this module and set its level
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+# How many times to try for an internet connection before starting recording
+connection_retries = 30
+
+#GPIO pin to signal shutdown
+Shutdown_GPIO_pin = 17
 
 def call_cmd_line(args, use_shell=True, print_output=False, run_in_bg=False):
 
@@ -40,7 +50,6 @@ def call_cmd_line(args, use_shell=True, print_output=False, run_in_bg=False):
 
     return res
 
-
 def update_time():
     # Updates time from the internet since the RPi is turned off most of the time
     # Read time from real-time clock module
@@ -57,9 +66,7 @@ def update_time():
         logger.info('Writing updated time to RTC')
         call_cmd_line('sudo hwclock -w')
 
-
-
-def check_internet_conn(led_driver=[], led_driver_chs=[], col_succ=[], col_fail=[], timeout=2):
+def check_internet_conn(timeout=2):
     """
     Check if there is a valid internet connection by fetching the entire content of Google's homepage and print the number of bytes.
     """
@@ -71,26 +78,20 @@ def check_internet_conn(led_driver=[], led_driver_chs=[], col_succ=[], col_fail=
         if response.status_code == 200:
             content_length = len(response.content)  # Get the number of bytes in the response content
             logger.debug("Successfully fetched Google's homepage. Content size: %s bytes.", content_length)
-            if led_driver:
-                set_led(led_driver, led_driver_chs, col_succ)
-            return True
         else:
             logger.debug("Failed to fetch Google's homepage. Status code: %s", response.status_code)
     except Exception as e:
         logger.debug("An error occurred: %s", e)
-        if led_driver:
-            set_led(led_driver, led_driver_chs, col_fail)
         return False
-
-
-def wait_for_internet_conn(n_tries, led_driver, led_driver_chs, col_succ, col_fail, timeout=2, verbose=False):
+    
+def wait_for_connection(n_tries, timeout=2, verbose=False):
     """
     Repeatedly check and wait for a valid internet conntection
     """
 
     is_conn = False
 
-    logger.info('Waiting for internet connection...')
+    logging.info('Waiting for internet connection...')
 
     for n_try in range(n_tries):
         # Try to connect to the internet
@@ -103,18 +104,16 @@ def wait_for_internet_conn(n_tries, led_driver, led_driver_chs, col_succ, col_fa
         # Otherwise sleep for a second and try again
         else:
             if verbose:
-                logger.info('No internet connection on try {}/{}'.format(n_try+1, n_tries))
+                logging.info('No internet connection on try {}/{}'.format(n_try+1, n_tries))
             time.sleep(1)
 
     if is_conn:
-        logger.info('Connected to the Internet')
-        set_led(led_driver, led_driver_chs, col_succ)
+        logging.info('Connected to the Internet')
+  
     else:
-        logger.info('No connection to internet after {} tries'.format(n_tries))
-        set_led(led_driver, led_driver_chs, col_fail)
+        logging.info('No connection to internet after {} tries'.format(n_tries))
 
     return is_conn
-
 
 def add_network_profile(name, apn, username, password):
     """ Add a new GSM connection profile to NetworkManager if there isn't already one with the same apn, username and password. """
@@ -155,137 +154,6 @@ def add_network_profile(name, apn, username, password):
     except subprocess.CalledProcessError as e:
         logger.info("Failed to add new connection: %s", e)
 
-
-def copy_sd_card_config(sd_mount_loc, config_fname):
-
-    """
-    Checks the boot sector on the SD card for any recorder config files -
-    if there are any, copy them to the relevant directories
-    """
-
-    sd_config_path = os.path.join(sd_mount_loc, config_fname)
-    local_config_path = config_fname
-
-    try:
-        # Try to load the config file on the SD card as JSON to validate it works
-        config = json.load(open(sd_config_path))
-    except Exception as e:
-        logger.info('Couldn\'t parse {} as valid JSON'.format(sd_config_path))
-        raise e
-
-    # Check it's not just the same as the one we're already using
-    if os.path.exists(local_config_path) and filecmp.cmp(sd_config_path, local_config_path):
-        logger.info('SD card config file ({}) matches existing config ({})'.format(sd_config_path, local_config_path))
-        return
-
-    # Copy the SD config file and reboot
-    # TODO: Indicate with LEDs / buzzer a new config has been found
-    logger.info('Copied config from SD to local')
-    shutil.copyfile(sd_config_path, local_config_path)
-
-    # Try to configure modem, but it's not required so escape any errors
-    try:
-        # Load the mobile network settings from the config file
-        config = json.load(open(local_config_path))
-        modem_config = config['mobile_network']
-        m_uname = modem_config['username']
-        m_pwd = modem_config['password']
-        m_host = modem_config['hostname']
-        m_conname = m_host.replace('.','') + config['device']['config_id']
-
-        m_uname = m_uname.strip()
-        m_pwd = m_pwd.strip()
-
-        # Add the profile to the network manager
-        logger.info('Adding network connection profile from config file')
-        add_network_profile(m_conname, m_host, m_uname, m_pwd)
-
-    except Exception as e:
-        logger.info('Couldn\'t add network manager profile from config file: {}'.format(str(e)))
-
-
-def mount_ext_sd(sd_mount_loc, dev_file_str='mmcblk1p'):
-
-    """
-    Tries to mount the external SD card, and if not possible flashes an error
-    code on the LEDs
-    """
-
-    # Check if SD card already mounted
-    if os.path.exists(sd_mount_loc) and os.path.ismount(sd_mount_loc):
-        logger.info('Device already mounted to {}. Assuming SD card, but warning - might not be!'.format(sd_mount_loc))
-        return
-
-    # Make sure sd_mount_loc is an empty directory
-    if os.path.exists(sd_mount_loc): shutil.rmtree(sd_mount_loc)
-    os.makedirs(sd_mount_loc)
-
-    # List potential devices that could be the SD card
-    potential_dev_fs = [f for f in os.listdir('/dev') if dev_file_str in f]
-
-    for dev_f in potential_dev_fs:
-        # Try to mount each partition in turn
-        logger.info('Trying to mount device {} to {}'.format(dev_f, sd_mount_loc))
-        call_cmd_line('sudo mount -orw /dev/{} {}'.format(dev_f, sd_mount_loc))
-
-        # Check if device mounted successfully
-        if os.path.ismount(sd_mount_loc):
-            logger.info('Successfully mounted {} to {}'.format(dev_f, sd_mount_loc))
-            break
-
-    # If unable to mount SD then raise an exception
-    if not os.path.ismount(sd_mount_loc):
-        logger.critical('ERROR: Could not mount external SD card to {}'.format(sd_mount_loc))
-        raise Exception('Could not mount external SD card to {}'.format(sd_mount_loc))
-
-
-def check_sd_not_corrupt(sd_mnt_dir):
-
-    """
-    Check the SD card allows writing data to each of the subdirectories, as
-    sometimes slightly corrupt cards will allow reads and writes to some locations
-    but not all. If corrupt, this function will raise an Exception
-    """
-
-    # Write and delete a dummy files to each subdirectory of the SD card to (quickly) check it's not corrupt
-    for (dirpath, dirnames, filenames) in os.walk(sd_mnt_dir):
-        for subd in dirnames:
-            subdir_path = os.path.join(dirpath, subd)
-
-            # Ignore system generated directories
-            if 'System Volume information' in subdir_path: continue
-
-            # Create and delete an empty text file
-            dummy_f_path = os.path.join(subdir_path, 'test_f.txt')
-            f = open(dummy_f_path, 'a')
-            f.close()
-            os.remove(dummy_f_path)
-
-    logger.info('check_sd_not_corrupt passed with no issues - SD should be OK')
-
-    return True
-
-
-def merge_dirs(root_src_dir, root_dst_dir, delete_src=True):
-
-    """
-    Merge two directories including all subdirectories, optionally delete root_src_dir
-    """
-
-    for src_dir, dirs, files in os.walk(root_src_dir):
-        dst_dir = src_dir.replace(root_src_dir, root_dst_dir, 1)
-        if not os.path.exists(dst_dir):
-            os.makedirs(dst_dir)
-        for file_ in files:
-            src_file = os.path.join(src_dir, file_)
-            dst_file = os.path.join(dst_dir, file_)
-            if os.path.exists(dst_file):
-                os.remove(dst_file)
-            shutil.copy(src_file, dst_dir)
-
-    if delete_src:
-        shutil.rmtree(root_src_dir, ignore_errors=True)
-
 def discover_serial():
 
     """
@@ -313,7 +181,7 @@ def discover_serial():
 
     return cpu_serial
 
-
+#Not currently used, but could be used for telemetry file in the future
 def get_sys_uptime():
     """
     Get system uptime in seconds
@@ -324,86 +192,158 @@ def get_sys_uptime():
 
     return uptime_seconds
 
+"""
+Framework from BUGG, but heavily modified
+"""
 
-def clean_dirs(working_dir, upload_dir, data_dir):
+#Sync to cloud
+def server_sync(cloud_dir, credentials_path, modem):
+    modem.power_on()
+    GLOBAL_is_connected = wait_for_connection(connection_retries)
 
-    """
-    Function to tidy up the directory structure, any files left in the working
-    directory and any directories in upload emptied by server mirroring
+    if GLOBAL_is_connected:
+        update_time()
 
-    Once tidied, then make new directories if needed
+        logger.info('Started upload to gc cloud dir {} at {}'.format(dt.datetime.utcnow(), cloud_dir))
+        Log.rotate_log()
 
-    Args
-        working_dir: Path to the working directory
-        upload_dir: Path to the upload directory
-        data_dir: Path to the data directory
-    """
+        try:
+            #Detect mounted USB 
+            usb_dirs = ['/mnt/x'] #Can add more common paths if unsure where it is mounted
+            usb_dir = next((d for d in usb_dirs if os.patg.isdir(d)), None)
 
-    ### CLEAN EMPTY DIRECTORIES
+            if not usb_dir:
+                logger.error('No USB detected')
+                return
+            
+            #Create archive dir on USB
+            archive_dir = os.path.join(usb_dir, 'uploaded')
+            os.makedirs(archive_dir, exist_ok=True)
 
-    if os.path.exists(working_dir):
-        logger.info('Cleaning up working directory')
-        shutil.rmtree(working_dir, ignore_errors=True)
+            #Get credentials from credentials json file
+            client = storage.client.from_service_account_json(credentials_path)
 
-    if os.path.exists(upload_dir):
-        # Remove empty directories in the upload directory, from bottom up
-        for subdir, dirs, files in os.walk(upload_dir, topdown=False):
-            if not os.listdir(subdir):
-                logger.info('Removing empty upload directory: {}'.format(subdir))
-                shutil.rmtree(subdir, ignore_errors=True)
+            #Find the right GCS bucket
+            device_conf = json.load(open(credentials_path))['device']
+            gcs_bucket_name = device_conf['gcs_bucket_name']
+            bucket = client.bucket(gcs_bucket_name)
 
+            # Loop through local files, uploading them to the server
+            for root, _, files in os.walk(usb_dir):
+                for local_f in files:
+                    local_path = os.path.join(root, local_f)
 
-    ### MAKE NEW DIRECTORIES (if needed)
+                    #Skip files in archive dir
+                    if archive_dir in local_path:
+                        continue
 
-    # Check for / create working directory (where temporary files will be stored)
-    if os.path.exists(working_dir) and os.path.isdir(working_dir):
-        logger.info('Using {} as working directory'.format(working_dir))
-    else:
-        os.makedirs(working_dir)
-        logger.info('Created {} as working directory'.format(working_dir))
+                    try:
+                        #Create remote path relative to USB and join it with the cloud dir
+                        remote_path = os.path.relpath(local_path, usb_dir)
+                        remote_path = os.path.join(cloud_dir, remote_path)
+                        logger.info('Uploading {} to {}'.format(local_path, remote_path))
 
-    # Check for / create upload directory (root which will be used to upload files from)
-    if os.path.exists(upload_dir) and os.path.isdir(upload_dir):
-        logger.info('Using {} as upload directory'.format(upload_dir))
-    else:
-        os.makedirs(upload_dir)
-        logger.info('Created {} as upload directory'.format(upload_dir))
+                        #Upload files
+                        upload_f = bucket.blob(remote_path)
+                        upload_f.upload_from_filename(filename=local_path)
 
-    # Check for / create data directory (where final data files will be stored) - must be under upload_dir
-    if os.path.exists(data_dir) and os.path.isdir(data_dir):
-        logger.info('Using {} as data directory'.format(data_dir))
-    else:
-        os.makedirs(data_dir)
-        logger.info('Created {} as data directory'.format(data_dir))
+                        #Create archive path
+                        relative_path = os.path.relpath(local_path, usb_dirs)
+                        archived_path = os.path.join(archive_dir, relative_path)
+                        os.makedirs(os.path.dirname(archived_path), exist_ok=True)
 
+                        #Move to archive instead of deleting
+                        shutil.move(local_path, archived_path)
+                        logger.info('Moved {} to archive'.format(local_path))
 
-def wait_for_connection(n_tries, timeout=2, verbose=False):
-    """
-    Repeatedly check and wait for a valid internet conntection
-    """
+                        # If the file did not upload successfully an Exception will be thrown
+                        # by upload_from_filename, so if we're here it's safe to delete the local file
+                        logger.info('Upload complete. Deleting local file at {}'.format(local_path))
+                        os.remove(local_path)   
 
-    is_conn = False
+                    except Exception as e:
+                        logger.info('Exception caught in gcs_server_sync: {}'.format(str(e)))
+                        continue
 
-    logging.info('Waiting for internet connection...')
+                    #Delete files after they're successfully sent
+                    try:
+                        if os.path.exists(archive_dir):
+                            shutil.rmtree(archive_dir)
+                            logger.info('Succesfully deleted archive_dir')
+                        
+                    except Exception as e:
+                        logger.info('Exception caught in archive cleanup in gcs_server_sync: {}'.format(str(e)))
 
-    for n_try in range(n_tries):
-        # Try to connect to the internet
-        is_conn = check_internet_conn(timeout=timeout)
+        except Exception as e:
+            logger.info('Exception caught in gcs_server_sync: {}'.format(str(e)))
+                        
+    else: 
+        logger.info('No internet connection available, not uploading')
 
-        # If connected break out
-        if is_conn:
-            break
+    logger.info('Diabling modem and RPi until next upload slot')
+    modem.power_off()
 
-        # Otherwise sleep for a second and try again
-        else:
-            if verbose:
-                logging.info('No internet connection on try {}/{}'.format(n_try+1, n_tries))
-            time.sleep(1)
+"""
+Functions fully written, not from BUGG
+"""
 
-    if is_conn:
-        logging.info('Connected to the Internet')
-  
-    else:
-        logging.info('No connection to internet after {} tries'.format(n_tries))
+#Compress files
+def wavtoflac(inputfile):
+    #Handling the name changing
+    inputname, _ = os.path.splitext(inputfile)
+    outputname = inputname + ".flac"
 
-    return is_conn
+    data, samplerate = sf.read(inputfile) #Read WAV file
+    sf.write(outputname, data, samplerate, subtype='FLAC') #Copies the file into a FLAC file
+
+    #Delete wav file after compression
+    if os.path.exists(outputname):  #Ensure the FLAC file was successfully created
+        os.remove(inputfile)        #and delete the wav file if it was
+        print(f"Deleted wav file: {inputfile}")
+
+    return outputname
+
+def convert_directory(dir):
+    #Puts all the wav files in a list, keeping their metadata
+    wav_files = []
+    for file in os.listdir(dir):
+        if file.lower().endswith('.wav'):
+            path = os.path.join(dir, file)
+
+            #Ensures it's a file and not a directory
+            if os.path.isfile(path):
+                lastedit = os.path.getmtime(path)
+                wav_files.append((lastedit, path))
+    
+    #Returns if there is no wav files in directory
+    if not wav_files:
+        print("No wav files")
+        return
+    
+    #Sorts wav files by last modification time in ascending order
+    wav_files.sort()
+
+    #Creates new list without the latest file
+    files_to_convert = [path for (lastedit, path) in wav_files[:-1]]
+
+    #Converts the files to flac
+    for inputfile in files_to_convert:
+        outputfile = wavtoflac(inputfile)
+        print(f"Converted: {inputfile} to {outputfile}")
+
+def shut_down():
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(Shutdown_GPIO_pin, GPIO.OUT)
+
+    #Set shutdown pin to high
+    GPIO.output(Shutdown_GPIO_pin, GPIO.HIGH)
+    time.sleep(1) #Delay long enough for MCU to detect pin being high
+
+    #Cleanup/reset GPIO Pins to default state
+    GPIO.cleanup()
+
+    #Turn off modem
+    Modem.power_off()
+
+    #Initiate safe shutdown
+    subprocess.run(["sudo", "shutdown", "-h", "now"])

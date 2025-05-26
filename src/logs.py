@@ -18,7 +18,7 @@ from .utils import discover_serial
 
 # The log_dir can't be included in config because we're
 # not loading config until after logging has started.
-LOG_DIR = '/home/logs/'
+LOG_DIR = '/home/src/logs/'
 
 # This establishes the lowest level of logging that will be output in each handler.
 # to the console and file. This can be changed to higher levels on a per-module basis.
