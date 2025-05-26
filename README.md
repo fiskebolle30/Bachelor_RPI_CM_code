@@ -6,10 +6,10 @@ The folder structure of the project is as follows: <br />
 src <br />
 ├── drivers <br />
 │   ├── __init.py__ <br />
-│   ├── lock.py \ <br />
-│   └── modem.py \ <br />
-├── logs \ <br />
-├── configs \ <br />
+│   ├── lock.py  <br />
+│   └── modem.py  <br />
+├── logs  <br />
+├── configs  <br />
 │   ├── Audiomoth.config <br />
 │   └── credentials.json <br />
 ├── __init.py__ <br />
