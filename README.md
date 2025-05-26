@@ -2,23 +2,25 @@
 All raspberry PI Compute module code for the bachelor project
 
 # Project structure
-The folder structure of the project is as follows:
-src
-├── drivers 
-│   ├── __init.py__ 
-│   ├── lock.py
-│   └── modem.py
-├── logs 
-├── configs
-│   ├── Audiomoth.config
-│   └── credentials.json
-├── __init.py__
-├── logs.py
-├── main.py 
-└── utils.py
+The folder structure of the project is as follows: <br />
+src <br />
+├── drivers <br />
+│   ├── __init.py__ <br />
+│   ├── lock.py \ <br />
+│   └── modem.py \ <br />
+├── logs \ <br />
+├── configs \ <br />
+│   ├── Audiomoth.config <br />
+│   └── credentials.json <br />
+├── __init.py__ <br />
+├── logs.py <br />
+├── main.py <br />
+└── utils.py <br />
 
-`src/drivers` contains Python modules the hardware driver for the modem. 
-`src/logs` is an empty folder where log files will be created
+<br />
+
+`src/drivers` contains Python modules the hardware driver for the modem. <br />
+`src/logs` is an empty folder where log files will be created <br />
 `src/configs` contains the configuration files and credentials for being able to connect to the 4G Network
 
 # Comments
