@@ -9,7 +9,7 @@ from drivers.modem import Modem
 config_name = "configs/Audiomoth.config"
 credentials_name = "configs/credentials.json"
 
-sd_mount_loc = 'mnt/x/'
+sd_mount_loc = 'mnt/x/' #x needs filled in with actual USB location (can be found by running lsusb in the RPi commnd prompt)
 
 GLOBAL_is_connected = False
 
@@ -25,7 +25,7 @@ def main():
     logging.getLogger().setLevel(logging.INFO)
     logger.info('RPi starting at %s' % start_time)
 
-    wav_directory = "pathtowavfiles"
+    wav_directory = "pathtowavfiles" #Needs changed to actual file path
 
     try:
        convert_directory(wav_directory) 

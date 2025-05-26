@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 # How many times to try for an internet connection before starting recording
-connection_retries = 30
+connection_retries = 30 #Can be changed if another amount of retries is preferred
 
 #GPIO pin to signal shutdown
 Shutdown_GPIO_pin = 17
